@@ -1,4 +1,2 @@
 vd_env/
-__pycache__/
-ffmpeg/ffmpeg.exe
-ffmpeg/ffprobe.exe
+__pycache__
