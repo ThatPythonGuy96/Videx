@@ -8,10 +8,10 @@ from hashlib import sha1
 from pathlib import Path
 
 from PyQt6.QtCore import QProcess, QSize, QTime, QTimer, Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QPainter, QPen
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
+from PyQt6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtWidgets import QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSizePolicy, QStatusBar, QStyle, QToolButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSpinBox, QStatusBar, QStyle, QToolButton, QVBoxLayout, QWidget, QSplashScreen
 
 
 class TrimTimeline(QWidget):
@@ -104,6 +104,22 @@ def time_text(milliseconds):
     return QTime(0, 0).addMSecs(max(0, milliseconds)).toString("mm:ss.zzz")[:-1]
 
 
+def parse_time(text):
+    """Convert seconds, mm:ss, or hh:mm:ss input to milliseconds."""
+    try:
+        parts = [float(part) for part in text.strip().split(":")]
+        if not 1 <= len(parts) <= 3 or any(part < 0 for part in parts):
+            raise ValueError
+        seconds = parts[-1]
+        if len(parts) >= 2:
+            seconds += parts[-2] * 60
+        if len(parts) == 3:
+            seconds += parts[0] * 3600
+        return round(seconds * 1000)
+    except ValueError as error:
+        raise ValueError("Use seconds, mm:ss.xx, or hh:mm:ss.xx.") from error
+
+
 def ffmpeg_command():
     """Prefer the portable FFmpeg bundled beside this application."""
     bundled = Path(__file__).resolve().parent / "ffmpeg" / "ffmpeg.exe"
@@ -152,6 +168,7 @@ class VidexWindow(QMainWindow):
         self.selection_playback = False
         self.export_process = None
         self.merge_process = None
+        self.active_job_duration_ms = 0
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
         self.audio.setVolume(0.7)
@@ -162,6 +179,7 @@ class VidexWindow(QMainWindow):
         self.pending_position = 0
         self.player.positionChanged.connect(self.on_position)
         self.player.durationChanged.connect(self.on_duration)
+        self.player.metaDataChanged.connect(self.on_metadata_changed)
         self.player.playbackStateChanged.connect(self.on_playback)
         self.player.errorOccurred.connect(lambda *_: self.statusBar().showMessage(self.player.errorString(), 6000))
         self.end_timer = QTimer(self)
@@ -228,14 +246,50 @@ class VidexWindow(QMainWindow):
         self.timeline.positionChanged.connect(self.player.setPosition)
         self.timeline.rangeChanged.connect(self.on_range_changed)
         c_layout.addWidget(self.timeline)
+        crop_row = QHBoxLayout()
+        self.crop_label = QLabel("CROP  Original")
+        self.crop_label.setObjectName("cropLabel")
+        crop_reset = QPushButton("Reset")
+        crop_16_9 = QPushButton("16:9")
+        crop_4_3 = QPushButton("4:3")
+        crop_square = QPushButton("1:1")
+        crop_portrait = QPushButton("9:16")
+        self.freeform = QPushButton("Freeform")
+        crop_reset.clicked.connect(lambda: self.set_crop_ratio(None))
+        crop_16_9.clicked.connect(lambda: self.set_crop_ratio(16 / 9))
+        crop_4_3.clicked.connect(lambda: self.set_crop_ratio(4 / 3))
+        crop_square.clicked.connect(lambda: self.set_crop_ratio(1))
+        crop_portrait.clicked.connect(lambda: self.set_crop_ratio(9 / 16))
+        self.freeform.clicked.connect(self.toggle_freeform)
+        self.freeform_inputs = []
+        for index, text in enumerate(("X", "Y", "W", "H")):
+            spin = QSpinBox()
+            spin.setPrefix(f"{text} ")
+            spin.setSuffix("%")
+            spin.setRange(0, 98) if index < 2 else spin.setRange(2, 100)
+            spin.setFixedWidth(70)
+            spin.setVisible(False)
+            spin.valueChanged.connect(self.set_freeform_crop)
+            self.freeform_inputs.append(spin)
+            crop_row.addWidget(spin)
+        crop_row.addWidget(self.crop_label); crop_row.addStretch(); crop_row.addWidget(QLabel("Crop")); crop_row.addWidget(crop_reset); crop_row.addWidget(crop_16_9); crop_row.addWidget(crop_4_3); crop_row.addWidget(crop_square); crop_row.addWidget(crop_portrait); crop_row.addWidget(self.freeform)
+        c_layout.addLayout(crop_row)
         row = QHBoxLayout()
         self.time_label = QLabel("00:00.00 / 00:00.00")
-        self.in_label = QLabel("IN  00:00.00")
-        self.out_label = QLabel("OUT  00:00.00")
+        in_caption = QLabel("IN")
+        out_caption = QLabel("OUT")
+        self.in_field = QLineEdit("00:00.00")
+        self.out_field = QLineEdit("00:00.00")
+        for field in (self.in_field, self.out_field):
+            field.setFixedWidth(92)
+            field.setToolTip("Enter seconds, mm:ss.xx, or hh:mm:ss.xx")
+            field.editingFinished.connect(self.apply_trim_time)
         set_in = QPushButton("Set In")
         set_out = QPushButton("Set Out")
-        set_in.clicked.connect(lambda: self.timeline.set_range(self.player.position(), self.timeline.end))
-        set_out.clicked.connect(lambda: self.timeline.set_range(self.timeline.start, self.player.position()))
+        set_in.setToolTip("Set the in point to the current playhead position")
+        set_out.setToolTip("Set the out point to the current playhead position")
+        set_in.clicked.connect(self.set_in_from_playhead)
+        set_out.clicked.connect(self.set_out_from_playhead)
         self.play = QToolButton()
         self.play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.play.clicked.connect(self.toggle_play)
@@ -244,8 +298,13 @@ class VidexWindow(QMainWindow):
         self.export = QPushButton("Export Trim")
         self.export.setObjectName("export")
         self.export.clicked.connect(self.export_trim)
-        row.addWidget(self.time_label); row.addStretch(); row.addWidget(self.in_label); row.addWidget(set_in); row.addWidget(self.out_label); row.addWidget(set_out); row.addWidget(self.play); row.addWidget(play_selection); row.addWidget(self.export)
+        row.addWidget(self.time_label); row.addStretch(); row.addWidget(in_caption); row.addWidget(self.in_field); row.addWidget(set_in); row.addWidget(out_caption); row.addWidget(self.out_field); row.addWidget(set_out); row.addWidget(self.play); row.addWidget(play_selection); row.addWidget(self.export)
         c_layout.addLayout(row)
+        self.progress = QProgressBar()
+        self.progress.setObjectName("progress")
+        self.progress.setFormat("Preparing export…")
+        self.progress.setVisible(False)
+        c_layout.addWidget(self.progress)
         editor_layout.addWidget(controls)
         workspace.addWidget(editor, 1)
         layout.addLayout(workspace, 1)
@@ -260,9 +319,9 @@ class VidexWindow(QMainWindow):
           QLabel#sideTitle { font-size: 12px; font-weight: 700; letter-spacing: 1px; } QLabel#sideHint, QLabel#clipDetails { color: #8492a8; font-size: 10px; } QLabel#clipName { color: #ecf1fc; font-weight: 600; }
           QVideoWidget { background: #090c12; border-radius: 10px; } QFrame#controls, QFrame#sidebar { background: #1a2130; border: 1px solid #2a3448; border-radius: 10px; }
           QListWidget#clipList { background: transparent; border: none; outline: none; } QListWidget#clipList::item { margin: 3px 0; border-radius: 6px; } QListWidget#clipList::item:selected { background: #2b4269; }
-          QPushButton, QToolButton { background: #273247; border: none; border-radius: 6px; padding: 8px 12px; color: #e8edf8; } QPushButton:hover, QToolButton:hover { background: #354463; }
+          QPushButton, QToolButton, QLineEdit { background: #273247; border: none; border-radius: 6px; padding: 8px 12px; color: #e8edf8; } QLineEdit:focus { border: 1px solid #438cff; } QPushButton:hover, QToolButton:hover { background: #354463; }
           QToolButton#deleteClip { background: transparent; color: #9eacc2; font-size: 18px; padding: 1px 5px; } QToolButton#deleteClip:hover { color: #ff8794; background: #372731; }
-          QPushButton#export, QPushButton#merge { background: #2676ff; font-weight: 600; } QPushButton#export:hover, QPushButton#merge:hover { background: #438cff; } QStatusBar { color: #91a0b8; background: #121722; }
+          QPushButton#export, QPushButton#merge { background: #2676ff; font-weight: 600; } QPushButton#export:hover, QPushButton#merge:hover { background: #438cff; } QProgressBar#progress { border: 1px solid #34435c; border-radius: 4px; height: 9px; text-align: center; color: #d9e5fb; } QProgressBar#progress::chunk { background: #2676ff; border-radius: 3px; } QStatusBar { color: #91a0b8; background: #121722; }
         """)
 
     def open_video(self):
@@ -272,7 +331,7 @@ class VidexWindow(QMainWindow):
 
     def add_clip(self, source):
         clip_id = sha1(f"{source.resolve()}:{len(self.clips)}".encode()).hexdigest()
-        clip = {"id": clip_id, "source": source, "start": 0, "end": 0, "duration": 0}
+        clip = {"id": clip_id, "source": source, "start": 0, "end": 0, "duration": 0, "size": None, "crop": (0.0, 0.0, 1.0, 1.0)}
         self.clips[clip_id] = clip
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, clip_id)
@@ -296,6 +355,8 @@ class VidexWindow(QMainWindow):
         self.current_file = clip["source"]
         self.timeline.set_duration(clip["duration"])
         self.timeline.set_range(clip["start"], clip["end"] if clip["end"] else clip["duration"])
+        self.update_crop_label()
+        self.sync_freeform_inputs()
         self.prepare_preview()
 
     def save_active_trim(self):
@@ -386,6 +447,71 @@ class VidexWindow(QMainWindow):
     def on_position(self, position):
         self.pending_position = position
 
+    def on_metadata_changed(self):
+        clip = self.active_clip()
+        if clip:
+            size = self.player.metaData().value(QMediaMetaData.Key.Resolution)
+            if size and size.width() and size.height():
+                clip["size"] = (size.width(), size.height())
+                self.update_crop_label()
+
+    def set_crop_ratio(self, ratio):
+        clip = self.active_clip()
+        if not clip:
+            return
+        if ratio is None:
+            clip["crop"] = (0.0, 0.0, 1.0, 1.0)
+        elif not clip["size"]:
+            QMessageBox.information(self, "Video is loading", "Wait for the video preview to load before choosing a crop ratio.")
+            return
+        else:
+            source_ratio = clip["size"][0] / clip["size"][1]
+            width, height = (ratio / source_ratio, 1.0) if source_ratio > ratio else (1.0, source_ratio / ratio)
+            clip["crop"] = ((1 - width) / 2, (1 - height) / 2, width, height)
+        self.update_crop_label()
+        self.sync_freeform_inputs()
+
+    def toggle_freeform(self):
+        visible = not self.freeform_inputs[0].isVisible()
+        for spin in self.freeform_inputs:
+            spin.setVisible(visible)
+        self.freeform.setText("Hide Fields" if visible else "Freeform")
+        if visible:
+            self.sync_freeform_inputs()
+
+    def sync_freeform_inputs(self):
+        clip = self.active_clip()
+        if not clip:
+            return
+        values = [round(value * 100) for value in clip["crop"]]
+        for spin, value in zip(self.freeform_inputs, values):
+            old = spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(old)
+
+    def set_freeform_crop(self, _value):
+        clip = self.active_clip()
+        if not clip:
+            return
+        x, y, width, height = (spin.value() for spin in self.freeform_inputs)
+        width = max(2, min(width, 100 - x))
+        height = max(2, min(height, 100 - y))
+        clip["crop"] = (x / 100, y / 100, width / 100, height / 100)
+        self.update_crop_label()
+
+    def update_crop_label(self):
+        clip = self.active_clip()
+        if not clip:
+            return
+        _x, _y, width, height = clip["crop"]
+        self.crop_label.setText("CROP  Original" if width == 1 and height == 1 else f"CROP  {width:.0%} × {height:.0%} centered")
+
+    def crop_filter(self, clip):
+        x, y, width, height = clip["crop"]
+        if (x, y, width, height) == (0.0, 0.0, 1.0, 1.0):
+            return ""
+        return f"crop=trunc(iw*{width:.8f}/2)*2:trunc(ih*{height:.8f}/2)*2:trunc(iw*{x:.8f}/2)*2:trunc(ih*{y:.8f}/2)*2"
+
     def on_range_changed(self, _start, _end):
         self.save_active_trim()
         self.update_labels()
@@ -398,8 +524,50 @@ class VidexWindow(QMainWindow):
 
     def update_labels(self):
         self.time_label.setText(f"{time_text(self.player.position())} / {time_text(self.timeline.duration)}")
-        self.in_label.setText(f"IN  {time_text(self.timeline.start)}")
-        self.out_label.setText(f"OUT  {time_text(self.timeline.end)}")
+        if not self.in_field.hasFocus():
+            self.in_field.setText(time_text(self.timeline.start))
+        if not self.out_field.hasFocus():
+            self.out_field.setText(time_text(self.timeline.end))
+
+    def apply_trim_time(self):
+        field = self.sender()
+        if not self.timeline.duration or field not in (self.in_field, self.out_field):
+            return
+        try:
+            value = min(parse_time(field.text()), self.timeline.duration)
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid trim time", str(error))
+            self.update_labels()
+            return
+        if field is self.in_field:
+            if value >= self.timeline.end:
+                QMessageBox.warning(self, "Invalid in point", "The in point must be before the out point.")
+                self.update_labels()
+                return
+            self.timeline.set_range(value, self.timeline.end)
+        else:
+            if value <= self.timeline.start:
+                QMessageBox.warning(self, "Invalid out point", "The out point must be after the in point.")
+                self.update_labels()
+                return
+            self.timeline.set_range(self.timeline.start, value)
+        field.setText(time_text(value))
+
+    def set_in_from_playhead(self):
+        position = self.player.position()
+        if position >= self.timeline.end:
+            QMessageBox.warning(self, "Invalid in point", "Move the playhead before the out point first.")
+            return
+        self.timeline.set_range(position, self.timeline.end)
+        self.in_field.setText(time_text(position))
+
+    def set_out_from_playhead(self):
+        position = self.player.position()
+        if position <= self.timeline.start:
+            QMessageBox.warning(self, "Invalid out point", "Move the playhead after the in point first.")
+            return
+        self.timeline.set_range(self.timeline.start, position)
+        self.out_field.setText(time_text(position))
 
     def toggle_play(self):
         self.selection_playback = False
@@ -422,6 +590,29 @@ class VidexWindow(QMainWindow):
         self.play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause if playing else QStyle.StandardPixmap.SP_MediaPlay))
         if not playing: self.end_timer.stop()
 
+    def start_progress(self, duration_ms, label):
+        self.active_job_duration_ms = max(1, duration_ms)
+        self.progress.setValue(0)
+        self.progress.setFormat(f"{label}  %p%")
+        self.progress.setVisible(True)
+
+    def consume_progress(self, process):
+        """Read FFmpeg's machine-readable progress stream from stdout."""
+        if not process:
+            return
+        for line in bytes(process.readAllStandardOutput()).decode(errors="replace").splitlines():
+            if line.startswith(("out_time_ms=", "out_time_us=")):
+                try:
+                    # FFmpeg names this field ms, but emits microseconds.
+                    elapsed_ms = int(line.split("=", 1)[1]) / 1000
+                    self.progress.setValue(min(99, round(elapsed_ms * 100 / self.active_job_duration_ms)))
+                except ValueError:
+                    pass
+
+    def finish_progress(self, successful):
+        self.progress.setValue(100 if successful else 0)
+        self.progress.setVisible(False)
+
     def export_trim(self):
         if not self.current_file or self.timeline.end <= self.timeline.start:
             QMessageBox.warning(self, "Nothing to export", "Load a video and select a non-empty trim range first.")
@@ -435,12 +626,19 @@ class VidexWindow(QMainWindow):
         if not output: return
         self.export.setEnabled(False); self.export.setText("Exporting…")
         self.statusBar().showMessage("Exporting trim with FFmpeg…")
+        self.start_progress(self.timeline.end - self.timeline.start, "Exporting trim")
         self.export_process = QProcess(self)
+        self.export_process.readyReadStandardOutput.connect(lambda: self.consume_progress(self.export_process))
         self.export_process.finished.connect(self.export_finished)
-        self.export_process.start(ffmpeg, ["-y", "-ss", f"{self.timeline.start / 1000:.3f}", "-i", str(self.current_file), "-t", f"{(self.timeline.end - self.timeline.start) / 1000:.3f}", "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", output])
+        args = ["-y", "-ss", f"{self.timeline.start / 1000:.3f}", "-i", str(self.current_file), "-t", f"{(self.timeline.end - self.timeline.start) / 1000:.3f}"]
+        if crop := self.crop_filter(self.active_clip()):
+            args.extend(["-vf", crop])
+        args.extend(["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", output])
+        self.export_process.start(ffmpeg, args)
 
     def export_finished(self, exit_code, _status):
         self.export.setEnabled(True); self.export.setText("Export Trim")
+        self.finish_progress(exit_code == 0)
         if exit_code == 0:
             self.statusBar().showMessage("Export complete", 5000)
             QMessageBox.information(self, "Export complete", "Your trimmed video has been saved.")
@@ -477,19 +675,24 @@ class VidexWindow(QMainWindow):
             args.extend(["-i", str(clip["source"])])
             start, end = clip["start"] / 1000, clip["end"] / 1000
             # Normalising makes merge dependable even when input clips differ.
-            filters.append(f"[{index}:v:0]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v{index}]")
+            crop = self.crop_filter(clip)
+            crop_prefix = f"{crop}," if crop else ""
+            filters.append(f"[{index}:v:0]{crop_prefix}trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v{index}]")
             filters.append(f"[{index}:a:0]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS,aresample=48000[a{index}]")
         joined = "".join(f"[v{i}][a{i}]" for i in range(len(clips)))
         filters.append(f"{joined}concat=n={len(clips)}:v=1:a=1[video][audio]")
         args.extend(["-filter_complex", ";".join(filters), "-map", "[video]", "-map", "[audio]", "-c:v", "libx264", "-preset", "medium", "-c:a", "aac", "-movflags", "+faststart", output])
         self.merge.setEnabled(False); self.merge.setText("Merging…")
         self.statusBar().showMessage("Merging trimmed clips…")
+        self.start_progress(sum(clip["end"] - clip["start"] for clip in clips), "Merging clips")
         self.merge_process = QProcess(self)
+        self.merge_process.readyReadStandardOutput.connect(lambda: self.consume_progress(self.merge_process))
         self.merge_process.finished.connect(self.merge_finished)
-        self.merge_process.start(ffmpeg, args)
+        self.merge_process.start(ffmpeg, args[:-1] + ["-progress", "pipe:1", "-nostats", args[-1]])
 
     def merge_finished(self, exit_code, _status):
         self.merge.setEnabled(True); self.merge.setText("Merge All Trims")
+        self.finish_progress(exit_code == 0)
         if exit_code == 0:
             self.statusBar().showMessage("Merge complete", 5000)
             QMessageBox.information(self, "Merge complete", "Your merged video has been saved.")
@@ -501,6 +704,14 @@ class VidexWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("Videx")
+    
+    pixmap = QPixmap("videx.png").scaled(500, 500, Qt.AspectRatioMode.KeepAspectRatioByExpanding)
+    splash = QSplashScreen(pixmap)
+    splash.show()
+    
+    app.processEvents()
+    
     window = VidexWindow()
     window.show()
+    splash.finish(window)
     sys.exit(app.exec())

@@ -2,6 +2,8 @@
 
 PyQt6 video trimmer. It uses the portable `ffmpeg/ffmpeg.exe` included in this project; FFmpeg on `PATH` is also supported as a fallback.
 
+The ffmpeg can be downloaded at https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+
 ```powershell
 python -m venv venv
 pip install -r requirements.txt
