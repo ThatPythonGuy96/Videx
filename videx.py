@@ -151,14 +151,14 @@ class ClipCard(QWidget):
         layout.addLayout(text, 1); layout.addWidget(delete)
 
     def set_details(self, start, end):
-        self.details.setText(f"{time_text(start)} — {time_text(end)}")
+        self.details.setText(f"{time_text(start)} — {time_text(end)} | {time_text(max(0, end - start))}")
 
 
 class VidexWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Videx — Video Trimmer")
-        self.resize(1000, 720)
+        self.setWindowState(Qt.WindowState.WindowMaximized)
         self.current_file = None
         self.active_clip_id = None
         self.clips = {}
@@ -167,6 +167,9 @@ class VidexWindow(QMainWindow):
         self.preview_process = None
         self.selection_playback = False
         self.export_process = None
+        self.export_output_path = None
+        self.export_destination = None
+        self.export_cancelled = False
         self.merge_process = None
         self.active_job_duration_ms = 0
         self.player = QMediaPlayer(self)
@@ -254,12 +257,15 @@ class VidexWindow(QMainWindow):
         crop_4_3 = QPushButton("4:3")
         crop_square = QPushButton("1:1")
         crop_portrait = QPushButton("9:16")
+        crop_top_95 = QPushButton("Top 95%")
+        crop_top_95.setToolTip("Set crop to X 0%, Y 0%, W 100%, H 95%")
         self.freeform = QPushButton("Freeform")
         crop_reset.clicked.connect(lambda: self.set_crop_ratio(None))
         crop_16_9.clicked.connect(lambda: self.set_crop_ratio(16 / 9))
         crop_4_3.clicked.connect(lambda: self.set_crop_ratio(4 / 3))
         crop_square.clicked.connect(lambda: self.set_crop_ratio(1))
         crop_portrait.clicked.connect(lambda: self.set_crop_ratio(9 / 16))
+        crop_top_95.clicked.connect(lambda: self.set_custom_crop(0, 0, 100, 95))
         self.freeform.clicked.connect(self.toggle_freeform)
         self.freeform_inputs = []
         for index, text in enumerate(("X", "Y", "W", "H")):
@@ -272,7 +278,7 @@ class VidexWindow(QMainWindow):
             spin.valueChanged.connect(self.set_freeform_crop)
             self.freeform_inputs.append(spin)
             crop_row.addWidget(spin)
-        crop_row.addWidget(self.crop_label); crop_row.addStretch(); crop_row.addWidget(QLabel("Crop")); crop_row.addWidget(crop_reset); crop_row.addWidget(crop_16_9); crop_row.addWidget(crop_4_3); crop_row.addWidget(crop_square); crop_row.addWidget(crop_portrait); crop_row.addWidget(self.freeform)
+        crop_row.addWidget(self.crop_label); crop_row.addStretch(); crop_row.addWidget(QLabel("Crop")); crop_row.addWidget(crop_reset); crop_row.addWidget(crop_16_9); crop_row.addWidget(crop_4_3); crop_row.addWidget(crop_square); crop_row.addWidget(crop_portrait); crop_row.addWidget(crop_top_95); crop_row.addWidget(self.freeform)
         c_layout.addLayout(crop_row)
         row = QHBoxLayout()
         self.time_label = QLabel("00:00.00 / 00:00.00")
@@ -304,7 +310,13 @@ class VidexWindow(QMainWindow):
         self.progress.setObjectName("progress")
         self.progress.setFormat("Preparing export…")
         self.progress.setVisible(False)
-        c_layout.addWidget(self.progress)
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(self.progress, 1)
+        self.cancel_export = QPushButton("Cancel")
+        self.cancel_export.setVisible(False)
+        self.cancel_export.clicked.connect(self.cancel_export_job)
+        progress_row.addWidget(self.cancel_export)
+        c_layout.addLayout(progress_row)
         editor_layout.addWidget(controls)
         workspace.addWidget(editor, 1)
         layout.addLayout(workspace, 1)
@@ -315,13 +327,24 @@ class VidexWindow(QMainWindow):
     def apply_style(self):
         self.setStyleSheet("""
           QMainWindow { background: #121722; color: #e8edf8; } QLabel { color: #c8d1e2; font-size: 12px; }
-          QLabel#logo { font-size: 20px; color: #f2f5fc; font-weight: 800; letter-spacing: 3px; } QLabel#subtitle { color: #6f7f98; font-size: 10px; letter-spacing: 2px; }
-          QLabel#sideTitle { font-size: 12px; font-weight: 700; letter-spacing: 1px; } QLabel#sideHint, QLabel#clipDetails { color: #8492a8; font-size: 10px; } QLabel#clipName { color: #ecf1fc; font-weight: 600; }
-          QVideoWidget { background: #090c12; border-radius: 10px; } QFrame#controls, QFrame#sidebar { background: #1a2130; border: 1px solid #2a3448; border-radius: 10px; }
-          QListWidget#clipList { background: transparent; border: none; outline: none; } QListWidget#clipList::item { margin: 3px 0; border-radius: 6px; } QListWidget#clipList::item:selected { background: #2b4269; }
-          QPushButton, QToolButton, QLineEdit { background: #273247; border: none; border-radius: 6px; padding: 8px 12px; color: #e8edf8; } QLineEdit:focus { border: 1px solid #438cff; } QPushButton:hover, QToolButton:hover { background: #354463; }
-          QToolButton#deleteClip { background: transparent; color: #9eacc2; font-size: 18px; padding: 1px 5px; } QToolButton#deleteClip:hover { color: #ff8794; background: #372731; }
-          QPushButton#export, QPushButton#merge { background: #2676ff; font-weight: 600; } QPushButton#export:hover, QPushButton#merge:hover { background: #438cff; } QProgressBar#progress { border: 1px solid #34435c; border-radius: 4px; height: 9px; text-align: center; color: #d9e5fb; } QProgressBar#progress::chunk { background: #2676ff; border-radius: 3px; } QStatusBar { color: #91a0b8; background: #121722; }
+          QLabel#logo { font-size: 20px; color: #e0720c; font-weight: 800; letter-spacing: 3px; } 
+          QLabel#subtitle { color: #a45409; font-size: 10px; letter-spacing: 2px; }
+          QLabel#sideTitle { font-size: 12px; font-weight: 700; letter-spacing: 1px; } 
+          QLabel#sideHint, QLabel#clipDetails { color: #a9bbd7; font-size: 10px; font-weight: 500; } 
+          QLabel#clipName { color: #ecf1fc; font-weight: 600; }
+          QVideoWidget { background: #090c12; border-radius: 10px; } 
+          QFrame#controls, QFrame#sidebar { background: #1a2130; border: 1px solid #2a3448; border-radius: 10px; }
+          QListWidget#clipList { background: transparent; border: none; outline: none; } 
+          QListWidget#clipList::item { margin: 3px 0; border-radius: 6px; } QListWidget#clipList::item:selected { background: #2b4269; }
+          QPushButton, QToolButton, QLineEdit { background: #273247; border: none; border-radius: 6px; padding: 8px 12px; color: #e8edf8; } 
+          QLineEdit:focus { border: 1px solid #438cff; } QPushButton:hover, QToolButton:hover { background: #384c75; }
+          QToolButton#deleteClip { background: transparent; color: #9eacc2; font-size: 18px; padding: 1px 5px; } 
+          QToolButton#deleteClip:hover { color: #ff8794; background: #372731; }
+          QPushButton#export, QPushButton#merge { background: #26ff88; font-weight: 600; color: #090000; } 
+          QPushButton#export:hover, QPushButton#merge:hover { background: #00ff11; } 
+          QProgressBar#progress { border: 1px solid #34435c; border-radius: 4px; height: 9px; text-align: center; color: #090000; font-weight: 700; } 
+          QProgressBar#progress::chunk { background: #2676ff; border-radius: 3px; } 
+          QStatusBar { color: #91a0b8; background: #121722; }
         """)
 
     def open_video(self):
@@ -479,6 +502,14 @@ class VidexWindow(QMainWindow):
         if visible:
             self.sync_freeform_inputs()
 
+    def set_custom_crop(self, x, y, width, height):
+        clip = self.active_clip()
+        if not clip:
+            return
+        clip["crop"] = (x / 100, y / 100, width / 100, height / 100)
+        self.update_crop_label()
+        self.sync_freeform_inputs()
+
     def sync_freeform_inputs(self):
         clip = self.active_clip()
         if not clip:
@@ -504,7 +535,7 @@ class VidexWindow(QMainWindow):
         if not clip:
             return
         _x, _y, width, height = clip["crop"]
-        self.crop_label.setText("CROP  Original" if width == 1 and height == 1 else f"CROP  {width:.0%} × {height:.0%} centered")
+        self.crop_label.setText("CROP  Original" if width == 1 and height == 1 else f"CROP  {width:.0%} × {height:.0%}")
 
     def crop_filter(self, clip):
         x, y, width, height = clip["crop"]
@@ -612,6 +643,20 @@ class VidexWindow(QMainWindow):
     def finish_progress(self, successful):
         self.progress.setValue(100 if successful else 0)
         self.progress.setVisible(False)
+        self.cancel_export.setVisible(False)
+
+    def cancel_export_job(self):
+        if not self.export_process or self.export_process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self.export_cancelled = True
+        self.cancel_export.setEnabled(False)
+        self.cancel_export.setText("Cancelling…")
+        self.export_process.terminate()
+        QTimer.singleShot(1500, self.kill_export_if_running)
+
+    def kill_export_if_running(self):
+        if self.export_cancelled and self.export_process and self.export_process.state() != QProcess.ProcessState.NotRunning:
+            self.export_process.kill()
 
     def export_trim(self):
         if not self.current_file or self.timeline.end <= self.timeline.start:
@@ -624,6 +669,13 @@ class VidexWindow(QMainWindow):
         default = self.current_file.with_name(f"{self.current_file.stem}_trimmed.mp4")
         output, _ = QFileDialog.getSaveFileName(self, "Export trimmed clip", str(default), "MP4 video (*.mp4)")
         if not output: return
+        self.export_destination = Path(output)
+        with tempfile.NamedTemporaryFile(prefix="videx-export-", suffix=".mp4", dir=str(self.export_destination.parent), delete=False) as temp_output:
+            self.export_output_path = Path(temp_output.name)
+        self.export_cancelled = False
+        self.cancel_export.setText("Cancel")
+        self.cancel_export.setEnabled(True)
+        self.cancel_export.setVisible(True)
         self.export.setEnabled(False); self.export.setText("Exporting…")
         self.statusBar().showMessage("Exporting trim with FFmpeg…")
         self.start_progress(self.timeline.end - self.timeline.start, "Exporting trim")
@@ -633,18 +685,32 @@ class VidexWindow(QMainWindow):
         args = ["-y", "-ss", f"{self.timeline.start / 1000:.3f}", "-i", str(self.current_file), "-t", f"{(self.timeline.end - self.timeline.start) / 1000:.3f}"]
         if crop := self.crop_filter(self.active_clip()):
             args.extend(["-vf", crop])
-        args.extend(["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", output])
+        args.extend(["-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(self.export_output_path)])
         self.export_process.start(ffmpeg, args)
 
     def export_finished(self, exit_code, _status):
         self.export.setEnabled(True); self.export.setText("Export Trim")
-        self.finish_progress(exit_code == 0)
-        if exit_code == 0:
+        successful = exit_code == 0 and not self.export_cancelled
+        details = ""
+        if successful:
+            try:
+                self.export_output_path.replace(self.export_destination)
+            except OSError as error:
+                successful = False
+                details = str(error)
+        if self.export_output_path and self.export_output_path.exists():
+            self.export_output_path.unlink(missing_ok=True)
+        self.finish_progress(successful)
+        if self.export_cancelled:
+            self.statusBar().showMessage("Export canceled", 5000)
+        elif successful:
             self.statusBar().showMessage("Export complete", 5000)
             QMessageBox.information(self, "Export complete", "Your trimmed video has been saved.")
         else:
-            details = bytes(self.export_process.readAllStandardError()).decode(errors="replace") if self.export_process else ""
+            details = details or (bytes(self.export_process.readAllStandardError()).decode(errors="replace") if self.export_process else "")
             QMessageBox.critical(self, "Export failed", details[-1200:] or "FFmpeg could not export this video.")
+        self.export_cancelled = False
+        self.cancel_export.setText("Cancel")
 
     def ordered_clips(self):
         clips = []
