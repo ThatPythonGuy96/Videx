@@ -768,6 +768,7 @@ class VidexWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    input_paths = sys.argv[1:]
     app = QApplication(sys.argv)
     app.setApplicationName("Videx")
     
@@ -779,5 +780,9 @@ if __name__ == "__main__":
     
     window = VidexWindow()
     window.show()
+    for arguments in input_paths:
+        video_path = Path(arguments).expanduser()
+        if video_path.is_file():
+            window.add_clip(video_path)
     splash.finish(window)
     sys.exit(app.exec())
